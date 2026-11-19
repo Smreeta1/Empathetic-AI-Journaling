@@ -47,6 +47,9 @@ def validate_memory_candidate(candidate):
     if missing_fields:
         return False, f"Missing fields: {sorted(missing_fields)}"
 
+    if not isinstance(candidate["node_type"], str):
+        return False, "Node type must be a string."
+
     if candidate["node_type"] not in ALLOWED_NODE_TYPES:
         return False, "Invalid node type."
 
@@ -56,12 +59,15 @@ def validate_memory_candidate(candidate):
     if not candidate["content"].strip():
         return False, "Content cannot be empty."
 
+    if not isinstance(candidate["sensitivity_level"], str):
+        return False, "Sensitivity level must be a string."
+
     if candidate["sensitivity_level"] not in ALLOWED_SENSITIVITY_LEVELS:
         return False, "Invalid sensitivity level."
 
     confidence = candidate["confidence"]
 
-    # bool is a subclass of int in Python, so reject it explicitly.
+   # checking if confidence is a boolean or not a number (int or float) as bool is a subclass of int in Python, so we need to explicitly check for it to avoid confusion.
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
         return False, "Confidence must be a number."
 

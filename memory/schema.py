@@ -49,13 +49,13 @@ def migrate_database():
                 f"Unsupported database version: {version}"
             )
 
-        # Temporarily disable foreign-key enforcement so we can
+        # Temporarily disable foreign-key enforcement so to
         # rebuild the related tables safely.
         connection.execute("PRAGMA foreign_keys = OFF")
 
         connection.execute("BEGIN IMMEDIATE")
 
-        # Create the replacement nodes table with 'preference'.
+        # Create the replacement nodes table with preference.
         connection.execute("""
             CREATE TABLE memory_nodes_new (
 
