@@ -4,3 +4,8 @@ __pycache__/
 .env
 .streamlit/secrets.toml
 journal_entries.json
+
+# Local memory database
+data/*.db
+data/*.db-wal
+data/*.db-shm
