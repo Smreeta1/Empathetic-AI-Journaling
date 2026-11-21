@@ -1,193 +1,427 @@
-
-import json
-from datetime import datetime
-from pathlib import Path
-
 import requests
 import streamlit as st
 
-
-MODEL = "llama3.2:3b"
-OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-JOURNAL_FILE = Path("journal_entries.json")
-
-SYSTEM_PROMPT = """
-You are a reflective journaling companion, not a therapist.
-
-Help the user reflect on their experience.
-
-- Acknowledge the feelings they describe without judging them.
-- Reflect only what they have shared. Do not invent details.
-- Avoid clichés, forced positivity, and dismissive reassurance.
-- Do not rush to give advice or solutions.
-- Ask at most one gentle, open-ended question when appropriate.
-- Respect the user's choice not to explore an issue further.
-- Use natural, concise, warm language.
-- Do not diagnose conditions or claim to know exactly how
-  the user feels.
-- If the user describes immediate danger, encourage them to
-  contact emergency services or a trusted person nearby.
-
-Keep your response brief and focused on reflection.
-"""
-
-
-def generate_reflection(entry, emotion):
-    """Generate a reflection using the local language model."""
-
-    prompt = f"""
-The user's self-described emotion is: {emotion}
-
-Journal entry:
-{entry}
-
-Respond naturally and without judgment.
-"""
-
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-            "options": {"temperature": 0.5},
-        },
-        timeout=180,
-    )
-
-    response.raise_for_status()
-    return response.json()["message"]["content"].strip()
+from memory.extractor import extract_memory_candidates
+from memory.graph_store import (
+    add_edge,
+    add_node,
+    approve_all_pending_nodes,
+    approve_node,
+    delete_all_graph_data,
+    delete_node,
+    get_all_edges,
+    get_all_nodes,
+    get_approved_nodes,
+    reject_node,
+    save_journal_entry,
+)
+from memory.responder import generate_grounded_response
+from memory.retriever import retrieve_contextual_subgraph
+from memory.schema import initialize_database
+from memory.validator import ALLOWED_RELATIONSHIP_TYPES
+from memory.visualizer import (
+    RELATIONSHIP_DESCRIPTIONS,
+    create_graph_dot,
+    get_node_label,
+)
 
 
-def save_entry(entry, emotion, reflection):
-    """Save a journal entry to a local JSON file."""
+@st.fragment
+def _render_memory_cards(visible_nodes, nodes, edges):
+    node_by_id = {n["id"]: n for n in nodes}
+    for node in visible_nodes:
+        connected = [
+            e for e in edges
+            if e["source_node_id"] == node["id"] or e["target_node_id"] == node["id"]
+        ]
+        with st.container(border=True):
+            st.markdown(f"**{node['node_type'].title()}**")
+            st.write(node["content"])
+            st.caption(
+                f"Status: {node['approval_status']} | "
+                f"Sensitivity: {node['sensitivity_level']} | "
+                f"Confidence: {node['confidence']} | "
+                f"Links: {len(connected)}"
+            )
+            for e in connected:
+                if e["source_node_id"] == node["id"]:
+                    other = node_by_id.get(e["target_node_id"])
+                    st.caption(f"→ `{e['relationship_type']}` → {other['content'] if other else e['target_node_id']}")
+                else:
+                    other = node_by_id.get(e["source_node_id"])
+                    st.caption(f"← `{e['relationship_type']}` ← {other['content'] if other else e['source_node_id']}")
 
-    if JOURNAL_FILE.exists():
-        with JOURNAL_FILE.open("r", encoding="utf-8") as file:
-            entries = json.load(file)
-    else:
-        entries = []
+            col_a, col_d = st.columns([1.2, 2.5])
+            if node["approval_status"] == "pending":
+                if col_a.button("Approve memory", key=f"g_app_{node['id']}"):
+                    approve_node(node["id"])
+                    st.rerun(scope="fragment")
+            if col_d.button(f"Delete memory ({len(connected)} link(s))", key=f"g_del_{node['id']}"):
+                try:
+                    delete_node(node["id"])
+                    st.rerun(scope="fragment")
+                except Exception as exc:
+                    st.error(f"Could not delete node: {exc}")
 
-    entries.append({
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "entry": entry,
-        "emotion": emotion,
-        "reflection": reflection,
-    })
-
-    with JOURNAL_FILE.open("w", encoding="utf-8") as file:
-        json.dump(entries, file, indent=2, ensure_ascii=False)
 
 
 st.set_page_config(
-    page_title="Reflect",
-    page_icon="✦",
-    layout="centered",
+    page_title="Reflect — Conversational Memory",
+    page_icon="🧠",
+    layout="wide",
 )
 
-st.title("Reflect")
-st.caption("A quiet space to put your thoughts into words.")
+initialize_database()
 
+st.title("Reflect — Conversational Memory")
+st.caption(
+    "A local-first journaling companion for remembering personal experiences, "
+    "connecting relationships and changes over time, and offering grounded reflections."
+)
 st.info(
-    "This prototype uses a local Ollama model for responses. "
-    "Saving is optional. Saved entries are unencrypted on this computer."
+    "Research prototype only. Not a mental-health or clinical service. "
+    "All extraction and reflections run locally via Ollama."
 )
 
-with st.form("journal_form"):
+for key, default in {
+    "memory_candidates": [],
+    "rejected_candidates": [],
+    "proposed_relationships": [],
+    "current_entry_id": None,
+    "retrieval_results": None,
+    "generated_answer": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+def _persist_proposed_relationships():
+    temp_to_db_id = {
+        c["temp_id"]: c["saved_id"]
+        for c in st.session_state.memory_candidates
+        if c.get("temp_id") and c.get("saved_id")
+    }
+    for rel in st.session_state.proposed_relationships:
+        if rel.get("saved"):
+            continue
+        src_db = temp_to_db_id.get(rel["source_temp_id"])
+        tgt_db = temp_to_db_id.get(rel["target_temp_id"])
+        if src_db and tgt_db and src_db != tgt_db:
+            add_edge(src_db, tgt_db, rel["relationship_type"], evidence=rel.get("evidence"))
+            rel["saved"] = True
+
+
+tab_extract, tab_graph, tab_retrieve = st.tabs([
+    "1. Journal & extract",
+    "2. Explore & manage graph",
+    "3. Ask & reflect",
+])
+
+
+# =========================================================
+# TAB 1: JOURNAL & EXTRACT MEMORIES
+# =========================================================
+with tab_extract:
+    st.subheader("Journal entry & automatic memory + relationship extraction")
+
+    default_entry = (
+        "A colleague praises me in front of other people "
+        "but later complains about me to our manager. "
+        "I feel confused because their behavior seems inconsistent."
+    )
     entry = st.text_area(
-        "What has been on your mind?",
-        placeholder="Write freely. You do not need to organise your thoughts.",
-        height=200,
+        "Write a journal entry about any life situation",
+        value=default_entry,
+        height=150,
+        key="journal_input",
     )
 
-    emotion = st.selectbox(
-        "How would you describe your current feeling? (Optional)",
-        [
-            "Not specified",
-            "Overwhelmed",
-            "Sad",
-            "Anxious",
-            "Frustrated",
-            "Lonely",
-            "Hopeful",
-            "Calm",
-            "Mixed feelings",
-        ],
+    auto_save_and_approve = st.checkbox(
+        "Automatically save, approve, and link extracted memories & relationships",
+        value=True,
     )
 
-    save_locally = st.checkbox(
-        "Save this entry and response on this computer",
-        value=False,
-    )
+    if st.button("Extract & save memories", type="primary"):
+        if not entry.strip():
+            st.warning("Please write a journal entry first.")
+        else:
+            with st.spinner("Extracting memories and relationships via Ollama..."):
+                try:
+                    entry_id = save_journal_entry(entry)
+                    st.session_state.current_entry_id = entry_id
 
-    submitted = st.form_submit_button(
-        "Reflect with me",
-        use_container_width=True,
-    )
+                    result = extract_memory_candidates(entry)
+                    valid_list = result["valid"]
+                    rel_list = result["relationships"]
 
-if submitted:
-    if not entry.strip():
-        st.warning("Write a few words before continuing.")
-    else:
-        try:
-            with st.spinner("Taking a moment to reflect..."):
-                reflection = generate_reflection(
-                    entry.strip(), emotion
-                )
+                    if auto_save_and_approve:
+                        for candidate in valid_list:
+                            node_id = add_node(
+                                node_type=candidate["node_type"],
+                                content=candidate["content"],
+                                source_entry_id=entry_id,
+                                sensitivity_level=candidate["sensitivity_level"],
+                                confidence=candidate["confidence"],
+                                auto_approve=True,
+                            )
+                            candidate["saved_id"] = node_id
+                            candidate["approval_status"] = "approved"
 
-            st.session_state["reflection"] = reflection
-            st.session_state["last_entry"] = entry.strip()
-            st.session_state["last_emotion"] = emotion
+                    st.session_state.memory_candidates = valid_list
+                    st.session_state.rejected_candidates = result["rejected"]
+                    st.session_state.proposed_relationships = rel_list
 
-            if save_locally:
-                save_entry(entry.strip(), emotion, reflection)
-                st.session_state["saved"] = True
-            else:
-                st.session_state["saved"] = False
+                    if auto_save_and_approve:
+                        _persist_proposed_relationships()
+                        st.success(
+                            f"Saved & approved {len(valid_list)} memories and linked "
+                            f"{len(rel_list)} relationships in your database."
+                        )
+                    else:
+                        st.success(
+                            f"Extracted {len(valid_list)} memories and {len(rel_list)} relationships."
+                        )
+                except requests.exceptions.ConnectionError:
+                    st.error("Cannot connect to Ollama. Make sure Ollama is running.")
+                except Exception as error:
+                    st.error(f"Extraction failed: {error}")
 
-        except requests.exceptions.ConnectionError:
-            st.error(
-                "Ollama is not responding. Check that it is running "
-                "and that the model is available."
-            )
-        except requests.exceptions.Timeout:
-            st.error(
-                "The model took too long to respond. Try again."
-            )
-        except (
-            requests.exceptions.RequestException,
-            ValueError,
-            KeyError,
-        ):
-            st.error(
-                "The response could not be processed. "
-                "Check Ollama and try again."
-            )
+    candidates = st.session_state.memory_candidates
+    if candidates:
+        st.divider()
+        st.subheader("Extracted memories")
+        for index, candidate in enumerate(candidates):
+            with st.container(border=True):
+                temp_tag = f" ({candidate['temp_id']})" if candidate.get("temp_id") else ""
+                st.markdown(f"**{candidate['node_type'].title()}** — Candidate {index + 1}{temp_tag}")
+                st.write(candidate["content"])
+                c1, c2, c3 = st.columns(3)
+                c1.caption(f"Type: {candidate['node_type']}")
+                c2.caption(f"Sensitivity: {candidate['sensitivity_level']}")
+                c3.caption(f"Confidence: {candidate['confidence']}")
 
-if "reflection" in st.session_state:
-    st.divider()
-    st.subheader("A moment to reflect")
-    st.write(st.session_state["reflection"])
+                saved_id = candidate.get("saved_id")
+                if saved_id:
+                    status = candidate.get("approval_status", "pending")
+                    st.caption(f"Status: {status}")
+                    if status == "pending":
+                        b1, b2 = st.columns(2)
+                        if b1.button("Approve", key=f"app_{index}_{saved_id}"):
+                            if approve_node(saved_id):
+                                candidate["approval_status"] = "approved"
+                                _persist_proposed_relationships()
+                                st.rerun()
+                        if b2.button("Reject", key=f"rej_{index}_{saved_id}"):
+                            if reject_node(saved_id):
+                                candidate["approval_status"] = "rejected"
+                                st.rerun()
+                else:
+                    if st.button("Save memory", key=f"sav_{index}"):
+                        node_id = add_node(
+                            node_type=candidate["node_type"],
+                            content=candidate["content"],
+                            source_entry_id=st.session_state.current_entry_id,
+                            sensitivity_level=candidate["sensitivity_level"],
+                            confidence=candidate["confidence"],
+                            auto_approve=True,
+                        )
+                        candidate["saved_id"] = node_id
+                        candidate["approval_status"] = "approved"
+                        _persist_proposed_relationships()
+                        st.rerun()
 
-    if st.session_state.get("saved"):
-        st.caption("Your entry and response were saved locally.")
+        if st.session_state.proposed_relationships:
+            st.markdown("#### Extracted relationships")
+            temp_lookup = {
+                c["temp_id"]: c["content"]
+                for c in candidates
+                if c.get("temp_id")
+            }
+            for rel in st.session_state.proposed_relationships:
+                src_text = temp_lookup.get(rel["source_temp_id"], rel["source_temp_id"])
+                tgt_text = temp_lookup.get(rel["target_temp_id"], rel["target_temp_id"])
+                state_txt = "Linked" if rel.get("saved") else "Awaiting node save"
+                st.caption(f"• **{src_text}** —[`{rel['relationship_type']}`]→ **{tgt_text}** ({state_txt})")
 
-    if st.button("Clear current reflection"):
-        for key in (
-            "reflection",
-            "last_entry",
-            "last_emotion",
-            "saved",
-        ):
-            st.session_state.pop(key, None)
 
+# =========================================================
+# TAB 2: EXPLORE & MANAGE GRAPH
+# =========================================================
+with tab_graph:
+    st.subheader("Persistent memory graph (data/memory.db)")
+    nodes = get_all_nodes()
+    edges = get_all_edges()
+    pending_nodes = [n for n in nodes if n["approval_status"] == "pending"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total memories", len(nodes))
+    c2.metric("Approved", sum(n["approval_status"] == "approved" for n in nodes))
+    c3.metric("Pending", len(pending_nodes))
+    c4.metric("Total links", len(edges))
+
+    if pending_nodes and st.button(f"Approve all {len(pending_nodes)} pending memories now"):
+        approve_all_pending_nodes()
         st.rerun()
 
-st.divider()
-st.caption(
-    "An experimental reflection tool, not a mental health service. "
-    "Responses may be inaccurate or unsuitable."
-)
+    if nodes:
+        graph_filter = st.selectbox(
+            "Display memories",
+            ["All memories", "Approved memories", "Pending memories", "Rejected memories"],
+        )
+        status_map = {
+            "All memories": None,
+            "Approved memories": "approved",
+            "Pending memories": "pending",
+            "Rejected memories": "rejected",
+        }
+        selected_status = status_map[graph_filter]
+        visible_nodes = [
+            n for n in nodes
+            if selected_status is None or n["approval_status"] == selected_status
+        ]
+        visible_ids = {n["id"] for n in visible_nodes}
+        visible_edges = [
+            e for e in edges
+            if e["source_node_id"] in visible_ids and e["target_node_id"] in visible_ids
+        ]
+
+        st.graphviz_chart(create_graph_dot(visible_nodes, visible_edges), width="stretch")
+        st.caption("Green = approved · Yellow = pending · Gray = rejected")
+
+        node_by_id = {n["id"]: n for n in nodes}
+        for node in visible_nodes:
+            connected = [
+                e for e in edges
+                if e["source_node_id"] == node["id"] or e["target_node_id"] == node["id"]
+            ]
+            with st.container(border=True):
+                st.markdown(f"**{node['node_type'].title()}**")
+                st.write(node["content"])
+                st.caption(
+                    f"Status: {node['approval_status']} | "
+                    f"Sensitivity: {node['sensitivity_level']} | "
+                    f"Confidence: {node['confidence']} | "
+                    f"Links: {len(connected)}"
+                )
+                for e in connected:
+                    if e["source_node_id"] == node["id"]:
+                        other = node_by_id.get(e["target_node_id"])
+                        st.caption(f"→ `{e['relationship_type']}` → {other['content'] if other else e['target_node_id']}")
+                    else:
+                        other = node_by_id.get(e["source_node_id"])
+                        st.caption(f"← `{e['relationship_type']}` ← {other['content'] if other else e['source_node_id']}")
+
+                col_a, col_d = st.columns([1.2, 2.5])
+                if node["approval_status"] == "pending":
+                    if col_a.button("Approve memory", key=f"g_app_{node['id']}"):
+                        approve_node(node["id"])
+                        st.rerun()
+                if col_d.button(f"Delete memory ({len(connected)} link(s))", key=f"g_del_{node['id']}"):
+                    delete_node(node["id"])
+                    st.rerun()
+
+    approved_nodes = [n for n in nodes if n["approval_status"] == "approved"]
+    if len(approved_nodes) >= 2:
+        with st.expander("Optional: Connect two approved memories manually"):
+            labels = {n["id"]: get_node_label(n) for n in approved_nodes}
+            src_id = st.selectbox("Source memory", list(labels.keys()), format_func=lambda v: labels[v], key="m_src")
+            tgt_opts = [nid for nid in labels if nid != src_id]
+            tgt_id = st.selectbox("Target memory", tgt_opts, format_func=lambda v: labels[v], key="m_tgt")
+            rel_type = st.selectbox(
+                "Relationship type",
+                sorted(ALLOWED_RELATIONSHIP_TYPES),
+                format_func=lambda v: f"{v} — {RELATIONSHIP_DESCRIPTIONS[v]}",
+            )
+            ev_text = st.text_input("Evidence (optional)", key="m_ev")
+            if st.button("Add relationship"):
+                add_edge(src_id, tgt_id, rel_type, evidence=ev_text or None)
+                st.rerun()
+
+    if nodes or edges:
+        st.divider()
+        with st.expander("Reset / delete all memories & relationships in database"):
+            confirm_wipe = st.checkbox("I understand this will delete all stored memories and links", key="confirm_wipe")
+            if st.button("Delete all memories & links", disabled=not confirm_wipe):
+                delete_all_graph_data()
+                st.session_state.retrieval_results = None
+                st.session_state.generated_answer = None
+                st.rerun()
+
+
+# =========================================================
+# TAB 3: ASK & REFLECT USING MEMORY
+# =========================================================
+with tab_retrieve:
+    st.subheader("Contextual graph retrieval & empathetic reflection")
+    st.caption(
+        "Retrieves matching approved memories and 1-hop graph neighbors in your database, "
+        "and generates a grounded reflection and ideas. (Reads memories only; never deletes data.)"
+    )
+
+    question = st.text_input(
+        "Ask a question",
+        placeholder="Who made the complaint? / Who was the complaint made to? / What did the colleague say publicly?",
+        key="memory_question",
+    )
+
+    b1, b2 = st.columns([2, 1])
+    with b1:
+        ask_clicked = st.button("Ask using memory", type="primary", width="stretch")
+    with b2:
+        if st.button("Clear displayed answer", width="stretch"):
+            st.session_state.retrieval_results = None
+            st.session_state.generated_answer = None
+            st.rerun()
+
+    if ask_clicked:
+        if not question.strip():
+            st.warning("Please enter a question.")
+        else:
+            approved_memories = get_approved_nodes()
+            all_db_edges = get_all_edges()
+            bundle = retrieve_contextual_subgraph(question, approved_memories, all_db_edges)
+            st.session_state.retrieval_results = bundle
+            st.session_state.generated_answer = None
+
+            with st.spinner("Generating grounded response from retrieved subgraph..."):
+                try:
+                    st.session_state.generated_answer = generate_grounded_response(question, bundle)
+                except requests.exceptions.ConnectionError:
+                    st.error("Cannot connect to Ollama for response generation.")
+                except Exception as error:
+                    st.error(f"Response generation failed: {error}")
+
+    bundle = st.session_state.retrieval_results
+    if bundle is not None:
+        st.divider()
+        if st.session_state.generated_answer:
+            st.markdown("### Reflect's response")
+            with st.container(border=True):
+                st.write(st.session_state.generated_answer)
+
+        if bundle.get("reasoning"):
+            st.caption(f"Retrieval rationale: {bundle['reasoning']}")
+
+        if bundle["direct_matches"]:
+            st.markdown("### Matched memories")
+            for m in bundle["direct_matches"]:
+                with st.container(border=True):
+                    st.write(m["content"])
+                    st.caption(f"Type: {m['node_type']}")
+
+        if bundle["expanded_memories"]:
+            st.markdown("### Connected graph memories (1-hop expansion)")
+            for m in bundle["expanded_memories"]:
+                with st.container(border=True):
+                    st.write(m["content"])
+                    st.caption(f"Type: {m['node_type']} | Connected via approved relationship")
+
+        if bundle["edges"]:
+            st.markdown("### Used relationships")
+            lookup = {n["id"]: n for n in bundle["all_nodes"]}
+            for e in bundle["edges"]:
+                s = lookup.get(e["source_node_id"])
+                t = lookup.get(e["target_node_id"])
+                if s and t:
+                    ev = f" — Evidence: {e['evidence']}" if e.get("evidence") else ""
+                    st.caption(f"• {s['content']} —[`{e['relationship_type']}`]→ {t['content']}{ev}")
